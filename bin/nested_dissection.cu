@@ -5,6 +5,7 @@
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 #include <algorithm>
+#include <random>
 #include <cassert>
 #include <numeric>
 #include <chrono>
@@ -12,6 +13,16 @@
 #include <set>
 #include <cmath>
 #include <climits>
+#include <curand.h>
+#include <curand_kernel.h>
+
+template <typename RandomIt>
+void simple_random_shuffle(RandomIt first, RandomIt last)
+{
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(first, last, g);
+}
 
 // CUDA kernel implementations
 __global__ void init_random_states(curandState *states, int n, unsigned long seed)
@@ -112,6 +123,9 @@ ImprovedGPUNestedDissection::~ImprovedGPUNestedDissection()
 }
 
 // Main compute ordering method
+// Improved Compute Ordering Function
+// Replace the existing compute_ordering function in nested_dissection.cu
+
 std::vector<int> ImprovedGPUNestedDissection::compute_ordering(const Graph &graph)
 {
     h_ordering.clear();
@@ -144,31 +158,65 @@ std::vector<int> ImprovedGPUNestedDissection::compute_ordering(const Graph &grap
             continue;
         }
 
-        // Use multilevel approach for larger subgraphs (currently disabled due to segfault)
-        if (task.vertices.size() > 1000) // Increased threshold to avoid multilevel for now
-        {
+        // Use multilevel approach for larger subgraphs (lowered threshold)
+        if (task.vertices.size() > 200)
+        { // Reduced from 1000 to 200
+            std::cout << "  Attempting multilevel partition..." << std::endl;
             Partition partition = multilevel_partition(graph, task.vertices);
             partition.print_stats();
 
-            // Store separators for later
-            for (int v : partition.separator_vertices)
-            {
-                separator_stack.push_back(v);
-            }
+            // Verify partition quality
+            int total_vertices = partition.left_vertices.size() +
+                                 partition.right_vertices.size() +
+                                 partition.separator_vertices.size();
 
-            // Add subtasks
-            if (!partition.left_vertices.empty())
+            if (total_vertices == task.vertices.size())
             {
-                task_queue.emplace(partition.left_vertices, task.level + 1);
+                // Partition is valid, use it
+                std::cout << "  Multilevel partition successful" << std::endl;
+
+                // Store separators for later
+                for (int v : partition.separator_vertices)
+                {
+                    separator_stack.push_back(v);
+                }
+
+                // Add subtasks
+                if (!partition.left_vertices.empty())
+                {
+                    task_queue.emplace(partition.left_vertices, task.level + 1);
+                }
+                if (!partition.right_vertices.empty())
+                {
+                    task_queue.emplace(partition.right_vertices, task.level + 1);
+                }
             }
-            if (!partition.right_vertices.empty())
+            else
             {
-                task_queue.emplace(partition.right_vertices, task.level + 1);
+                // Partition failed, fall back to direct
+                std::cout << "  Multilevel partition invalid, using direct" << std::endl;
+                Partition direct_partition_result = direct_partition(graph, task.vertices);
+                direct_partition_result.print_stats();
+
+                for (int v : direct_partition_result.separator_vertices)
+                {
+                    separator_stack.push_back(v);
+                }
+
+                if (!direct_partition_result.left_vertices.empty())
+                {
+                    task_queue.emplace(direct_partition_result.left_vertices, task.level + 1);
+                }
+                if (!direct_partition_result.right_vertices.empty())
+                {
+                    task_queue.emplace(direct_partition_result.right_vertices, task.level + 1);
+                }
             }
         }
         else
         {
             // Use direct partitioning for smaller graphs
+            std::cout << "  Using direct partitioning" << std::endl;
             Partition partition = direct_partition(graph, task.vertices);
             partition.print_stats();
 
@@ -188,79 +236,157 @@ std::vector<int> ImprovedGPUNestedDissection::compute_ordering(const Graph &grap
         }
     }
 
-    // Add separators at the end in reverse order
+    // Add separators at the end in reverse order (typical nested dissection)
     std::reverse(separator_stack.begin(), separator_stack.end());
     for (int v : separator_stack)
     {
         h_ordering.push_back(v);
     }
 
+    std::cout << "Final ordering: " << h_ordering.size() << " vertices" << std::endl;
+
+    // Verify ordering completeness
+    if (h_ordering.size() != graph.n_vertices)
+    {
+        std::cerr << "Warning: Incomplete ordering! Expected " << graph.n_vertices
+                  << ", got " << h_ordering.size() << std::endl;
+    }
+
     return h_ordering;
 }
 
-// METIS-inspired multilevel partitioning
+// Improved Multilevel Partitioning
+// Replace the existing multilevel_partition function in nested_dissection.cu
+
+// Improved Multilevel Partitioning
+// Replace the existing multilevel_partition function in nested_dissection.cu
+
 Partition ImprovedGPUNestedDissection::multilevel_partition(const Graph &original, const std::vector<int> &vertices)
 {
     std::cout << "  Using multilevel partitioning" << std::endl;
 
-    // For now, fall back to direct partitioning to avoid segfault
-    // TODO: Fix multilevel implementation
-    std::cout << "  (Falling back to direct partitioning)" << std::endl;
-    return direct_partition(original, vertices);
-
-    /*
-    // Extract subgraph
-    Graph subgraph = extract_subgraph(original, vertices);
-
-    // Coarsening phase - use heavy edge matching
-    std::vector<Graph> graph_hierarchy;
-    std::vector<std::vector<int>> vertex_mappings;
-
-    Graph current_graph = subgraph;
-    graph_hierarchy.push_back(current_graph);
-
-    // Coarsen until small enough
-    while (current_graph.n_vertices > 50)
+    // Safety check: if subgraph is too small, use direct partitioning
+    if (vertices.size() < 100)
     {
-        auto [coarse_graph, mapping] = coarsen_graph(current_graph);
-        if (coarse_graph.n_vertices >= current_graph.n_vertices * 0.8)
+        std::cout << "  (Too small for multilevel, using direct)" << std::endl;
+        return direct_partition(original, vertices);
+    }
+
+    try
+    {
+        // Extract subgraph
+        Graph subgraph = extract_subgraph(original, vertices);
+
+        // Coarsening phase - use heavy edge matching
+        std::vector<Graph> graph_hierarchy;
+        std::vector<std::vector<int>> vertex_mappings;
+
+        // Store the initial subgraph
+        graph_hierarchy.push_back(std::move(subgraph));
+
+        // Coarsen until small enough or no more reduction possible
+        int coarsening_levels = 0;
+        const int max_coarsening_levels = 10;
+
+        while (graph_hierarchy.back().n_vertices > 50 && coarsening_levels < max_coarsening_levels)
         {
-            // Not enough reduction, stop coarsening
-            break;
+            auto [coarse_graph, mapping] = coarsen_graph(graph_hierarchy.back());
+
+            // Check if we got sufficient reduction
+            double reduction_ratio = (double)coarse_graph.n_vertices / graph_hierarchy.back().n_vertices;
+            if (reduction_ratio > 0.85)
+            {
+                // Not enough reduction, stop coarsening
+                std::cout << "  Insufficient reduction (" << (reduction_ratio * 100)
+                          << "%), stopping coarsening" << std::endl;
+                break;
+            }
+
+            vertex_mappings.push_back(mapping);
+            graph_hierarchy.push_back(std::move(coarse_graph));
+            coarsening_levels++;
+
+            std::cout << "  Coarsening level " << coarsening_levels
+                      << ": " << graph_hierarchy.back().n_vertices << " vertices" << std::endl;
         }
 
-        graph_hierarchy.push_back(coarse_graph);
-        vertex_mappings.push_back(mapping);
-        current_graph = coarse_graph;
-    }
+        // Initial partition of coarsest graph
+        Partition coarse_partition = initial_partition(graph_hierarchy.back());
+        std::cout << "  Initial partition on coarsest graph completed" << std::endl;
 
-    // Initial partition of coarsest graph
-    Partition coarse_partition = initial_partition(graph_hierarchy.back());
+        // Uncoarsening and refinement phase
+        for (int i = graph_hierarchy.size() - 2; i >= 0; i--)
+        {
+            std::cout << "  Projecting to level " << i
+                      << " (" << graph_hierarchy[i].n_vertices << " vertices)" << std::endl;
+            std::cout << "  Current partition sizes: L=" << coarse_partition.left_vertices.size()
+                      << " R=" << coarse_partition.right_vertices.size()
+                      << " S=" << coarse_partition.separator_vertices.size() << std::endl;
 
-    // Uncoarsening and refinement phase
-    for (int i = graph_hierarchy.size() - 2; i >= 0; i--)
-    {
-        coarse_partition = project_and_refine(graph_hierarchy[i], coarse_partition,
-                                            vertex_mappings[i]);
-    }
+            // Safety check before projection
+            if (i < vertex_mappings.size())
+            {
+                std::cout << "  Vertex mapping size: " << vertex_mappings[i].size() << std::endl;
+                coarse_partition = project_and_refine(graph_hierarchy[i], coarse_partition,
+                                                      vertex_mappings[i]);
+            }
+            else
+            {
+                std::cout << "  ERROR: Invalid mapping index " << i << std::endl;
+                break;
+            }
+        }
 
-    // Map back to original vertex IDs
-    Partition final_partition;
-    for (int v : coarse_partition.left_vertices)
-    {
-        final_partition.left_vertices.push_back(vertices[v]);
-    }
-    for (int v : coarse_partition.right_vertices)
-    {
-        final_partition.right_vertices.push_back(vertices[v]);
-    }
-    for (int v : coarse_partition.separator_vertices)
-    {
-        final_partition.separator_vertices.push_back(vertices[v]);
-    }
+        // Map back to original vertex IDs
+        Partition final_partition;
+        std::cout << "  Mapping back to original vertices (size: " << vertices.size() << ")" << std::endl;
 
-    return final_partition;
-    */
+        for (int v : coarse_partition.left_vertices)
+        {
+            if (v >= 0 && v < vertices.size())
+            {
+                final_partition.left_vertices.push_back(vertices[v]);
+            }
+            else
+            {
+                std::cout << "  WARNING: Invalid left vertex index " << v << std::endl;
+            }
+        }
+        for (int v : coarse_partition.right_vertices)
+        {
+            if (v >= 0 && v < vertices.size())
+            {
+                final_partition.right_vertices.push_back(vertices[v]);
+            }
+            else
+            {
+                std::cout << "  WARNING: Invalid right vertex index " << v << std::endl;
+            }
+        }
+        for (int v : coarse_partition.separator_vertices)
+        {
+            if (v >= 0 && v < vertices.size())
+            {
+                final_partition.separator_vertices.push_back(vertices[v]);
+            }
+            else
+            {
+                std::cout << "  WARNING: Invalid separator vertex index " << v << std::endl;
+            }
+        }
+
+        final_partition.edge_cut = coarse_partition.edge_cut;
+        final_partition.balance_ratio = coarse_partition.balance_ratio;
+
+        std::cout << "  Multilevel partitioning completed successfully" << std::endl;
+        return final_partition;
+    }
+    catch (const std::exception &e)
+    {
+        std::cout << "  Multilevel partitioning failed: " << e.what() << std::endl;
+        std::cout << "  Falling back to direct partitioning" << std::endl;
+        return direct_partition(original, vertices);
+    }
 }
 
 // Fallback direct partitioning (improved geometric + graph-based)
@@ -273,26 +399,172 @@ Partition ImprovedGPUNestedDissection::direct_partition(const Graph &graph, cons
 }
 
 // Heavy edge matching for coarsening (currently simplified to avoid segfaults)
+
 std::pair<Graph, std::vector<int>> ImprovedGPUNestedDissection::coarsen_graph(const Graph &graph)
 {
-    // Simplified coarsening - just return the same graph for now
-    // TODO: Implement proper heavy edge matching
+    // Host arrays for processing
+    std::vector<int> h_row_ptr(graph.n_vertices + 1);
+    std::vector<int> h_col_idx(graph.n_edges);
+    std::vector<int> h_edge_weights(graph.n_edges);
+    std::vector<int> h_vertex_weights(graph.n_vertices);
 
+    // Copy graph to host
+    cudaMemcpy(h_row_ptr.data(), graph.row_ptr,
+               (graph.n_vertices + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_col_idx.data(), graph.col_idx,
+               graph.n_edges * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_edge_weights.data(), graph.edge_weights,
+               graph.n_edges * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_vertex_weights.data(), graph.vertex_weights,
+               graph.n_vertices * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Heavy Edge Matching - find the heaviest edge for each vertex
+    std::vector<int> match(graph.n_vertices, -1);
+    std::vector<bool> matched(graph.n_vertices, false);
+
+    // Process vertices in random order for better matching
+    std::vector<int> vertex_order(graph.n_vertices);
+    std::iota(vertex_order.begin(), vertex_order.end(), 0);
+
+    // Use modern shuffle instead of deprecated random_shuffle
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(vertex_order.begin(), vertex_order.end(), g);
+
+    for (int v : vertex_order)
+    {
+        if (matched[v])
+            continue;
+
+        int best_neighbor = -1;
+        int max_weight = -1;
+
+        // Find heaviest neighbor that is not matched
+        for (int e = h_row_ptr[v]; e < h_row_ptr[v + 1]; e++)
+        {
+            int neighbor = h_col_idx[e];
+            int weight = h_edge_weights[e];
+
+            if (!matched[neighbor] && neighbor != v && weight > max_weight)
+            {
+                max_weight = weight;
+                best_neighbor = neighbor;
+            }
+        }
+
+        // Match with best neighbor if found
+        if (best_neighbor != -1)
+        {
+            match[v] = best_neighbor;
+            match[best_neighbor] = v;
+            matched[v] = true;
+            matched[best_neighbor] = true;
+        }
+    }
+
+    // Create vertex mapping from old to new
     std::vector<int> vertex_map(graph.n_vertices);
-    std::iota(vertex_map.begin(), vertex_map.end(), 0);
+    int new_vertex_count = 0;
 
-    // Create a copy of the input graph
-    Graph coarse_graph(graph.n_vertices, graph.n_edges);
+    // First pass: assign new vertex IDs
+    for (int v = 0; v < graph.n_vertices; v++)
+    {
+        if (match[v] == -1)
+        {
+            // Unmatched vertex becomes a new vertex
+            vertex_map[v] = new_vertex_count++;
+        }
+        else if (v < match[v])
+        {
+            // For matched pair, smaller ID represents the new vertex
+            vertex_map[v] = new_vertex_count;
+            vertex_map[match[v]] = new_vertex_count;
+            new_vertex_count++;
+        }
+    }
 
-    // Copy data from original graph
-    cudaMemcpy(coarse_graph.row_ptr, graph.row_ptr,
-               (graph.n_vertices + 1) * sizeof(int), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(coarse_graph.col_idx, graph.col_idx,
-               graph.n_edges * sizeof(int), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(coarse_graph.edge_weights, graph.edge_weights,
-               graph.n_edges * sizeof(int), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(coarse_graph.vertex_weights, graph.vertex_weights,
-               graph.n_vertices * sizeof(int), cudaMemcpyDeviceToDevice);
+    // Build coarse graph adjacency lists
+    std::vector<std::vector<std::pair<int, int>>> coarse_adj(new_vertex_count);
+    std::vector<int> coarse_vertex_weights(new_vertex_count, 0);
+
+    // Process each original vertex
+    for (int v = 0; v < graph.n_vertices; v++)
+    {
+        int new_v = vertex_map[v];
+        coarse_vertex_weights[new_v] += h_vertex_weights[v];
+
+        // Add edges from this vertex
+        for (int e = h_row_ptr[v]; e < h_row_ptr[v + 1]; e++)
+        {
+            int neighbor = h_col_idx[e];
+            int new_neighbor = vertex_map[neighbor];
+            int weight = h_edge_weights[e];
+
+            // Skip self-loops in coarse graph
+            if (new_v != new_neighbor)
+            {
+                coarse_adj[new_v].push_back({new_neighbor, weight});
+            }
+        }
+    }
+
+    // Merge parallel edges (sum weights)
+    for (auto &neighbors : coarse_adj)
+    {
+        std::sort(neighbors.begin(), neighbors.end());
+        auto it = neighbors.begin();
+        while (it != neighbors.end())
+        {
+            auto next_it = it + 1;
+            while (next_it != neighbors.end() && next_it->first == it->first)
+            {
+                it->second += next_it->second;
+                next_it = neighbors.erase(next_it);
+            }
+            ++it;
+        }
+    }
+
+    // Count total edges in coarse graph
+    int coarse_edges = 0;
+    for (const auto &neighbors : coarse_adj)
+    {
+        coarse_edges += neighbors.size();
+    }
+
+    // Create coarse graph in CSR format
+    Graph coarse_graph(new_vertex_count, coarse_edges);
+    std::vector<int> coarse_row_ptr(new_vertex_count + 1, 0);
+    std::vector<int> coarse_col_idx(coarse_edges);
+    std::vector<int> coarse_edge_weights(coarse_edges);
+
+    int edge_pos = 0;
+    for (int v = 0; v < new_vertex_count; v++)
+    {
+        coarse_row_ptr[v] = edge_pos;
+        for (auto [neighbor, weight] : coarse_adj[v])
+        {
+            coarse_col_idx[edge_pos] = neighbor;
+            coarse_edge_weights[edge_pos] = weight;
+            edge_pos++;
+        }
+    }
+    coarse_row_ptr[new_vertex_count] = edge_pos;
+
+    // Copy to device
+    cudaMemcpy(coarse_graph.row_ptr, coarse_row_ptr.data(),
+               (new_vertex_count + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(coarse_graph.col_idx, coarse_col_idx.data(),
+               coarse_edges * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(coarse_graph.edge_weights, coarse_edge_weights.data(),
+               coarse_edges * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(coarse_graph.vertex_weights, coarse_vertex_weights.data(),
+               new_vertex_count * sizeof(int), cudaMemcpyHostToDevice);
+
+    std::cout << "  Coarsened from " << graph.n_vertices << " to "
+              << new_vertex_count << " vertices (reduction: "
+              << (100.0 * (graph.n_vertices - new_vertex_count) / graph.n_vertices)
+              << "%)" << std::endl;
 
     return {std::move(coarse_graph), vertex_map};
 }
@@ -640,29 +912,71 @@ Partition ImprovedGPUNestedDissection::initial_partition(const Graph &graph)
 }
 
 // Project partition to finer graph and refine
+// Safer Project and Refine Function
+// Replace the existing project_and_refine function in nested_dissection.cu
+
 Partition ImprovedGPUNestedDissection::project_and_refine(const Graph &fine_graph, const Partition &coarse_partition,
                                                           const std::vector<int> &vertex_mapping)
 {
+    std::cout << "    Projecting partition from " << vertex_mapping.size()
+              << " coarse vertices to " << fine_graph.n_vertices << " fine vertices" << std::endl;
+
+    // Safety check
+    if (vertex_mapping.size() != fine_graph.n_vertices)
+    {
+        std::cout << "    ERROR: Vertex mapping size mismatch!" << std::endl;
+        // Return a simple bisection as fallback
+        Partition fallback;
+        for (int i = 0; i < fine_graph.n_vertices; i++)
+        {
+            if (i < fine_graph.n_vertices / 2)
+            {
+                fallback.left_vertices.push_back(i);
+            }
+            else
+            {
+                fallback.right_vertices.push_back(i);
+            }
+        }
+        return fallback;
+    }
+
     // Project partition to finer graph
     Partition projected;
 
-    // Create reverse mapping
-    std::vector<int> coarse_to_fine_mapping(coarse_partition.left_vertices.size() +
-                                            coarse_partition.right_vertices.size() +
-                                            coarse_partition.separator_vertices.size());
+    // Create a mapping from coarse vertex to partition assignment
+    std::vector<int> coarse_assignment;
+    int max_coarse_vertex = 0;
 
-    int coarse_idx = 0;
+    // Find the maximum coarse vertex ID
+    for (int mapping : vertex_mapping)
+    {
+        max_coarse_vertex = std::max(max_coarse_vertex, mapping);
+    }
+
+    coarse_assignment.resize(max_coarse_vertex + 1, -1);
+
+    // Assign partitions to coarse vertices
     for (int v : coarse_partition.left_vertices)
     {
-        coarse_to_fine_mapping[v] = 0; // left partition
+        if (v >= 0 && v < coarse_assignment.size())
+        {
+            coarse_assignment[v] = 0; // left partition
+        }
     }
     for (int v : coarse_partition.right_vertices)
     {
-        coarse_to_fine_mapping[v] = 1; // right partition
+        if (v >= 0 && v < coarse_assignment.size())
+        {
+            coarse_assignment[v] = 1; // right partition
+        }
     }
     for (int v : coarse_partition.separator_vertices)
     {
-        coarse_to_fine_mapping[v] = -1; // separator
+        if (v >= 0 && v < coarse_assignment.size())
+        {
+            coarse_assignment[v] = 2; // separator
+        }
     }
 
     // Project each fine vertex based on its coarse vertex assignment
@@ -670,9 +984,9 @@ Partition ImprovedGPUNestedDissection::project_and_refine(const Graph &fine_grap
     {
         int coarse_v = vertex_mapping[fine_v];
 
-        if (coarse_v < coarse_to_fine_mapping.size())
+        if (coarse_v >= 0 && coarse_v < coarse_assignment.size())
         {
-            int assignment = coarse_to_fine_mapping[coarse_v];
+            int assignment = coarse_assignment[coarse_v];
             if (assignment == 0)
             {
                 projected.left_vertices.push_back(fine_v);
@@ -681,19 +995,28 @@ Partition ImprovedGPUNestedDissection::project_and_refine(const Graph &fine_grap
             {
                 projected.right_vertices.push_back(fine_v);
             }
-            else
+            else if (assignment == 2)
             {
                 projected.separator_vertices.push_back(fine_v);
+            }
+            else
+            {
+                // Unassigned coarse vertex, default to left
+                projected.left_vertices.push_back(fine_v);
             }
         }
         else
         {
-            // Default assignment for unmapped vertices
+            // Invalid coarse vertex mapping, default to left
             projected.left_vertices.push_back(fine_v);
         }
     }
 
-    // Apply basic local refinement (simplified KL-style)
+    std::cout << "    Projected partition: L=" << projected.left_vertices.size()
+              << " R=" << projected.right_vertices.size()
+              << " S=" << projected.separator_vertices.size() << std::endl;
+
+    // Apply basic local refinement (simplified and safer)
     return apply_local_refinement(fine_graph, projected);
 }
 
