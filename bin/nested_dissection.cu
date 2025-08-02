@@ -16,6 +16,291 @@
 #include <curand.h>
 #include <curand_kernel.h>
 
+// Enhanced GPU kernels for heavy edge matching and graph coarsening
+// Add these to your nested_dissection.cu file
+
+// Additional kernel for counting coarse vertex degrees
+__global__ void count_coarse_vertex_degrees(int *row_ptr, int *col_idx, int *vertex_map,
+                                            int *degree_count, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        int coarse_v = vertex_map[idx];
+
+        for (int e = row_ptr[idx]; e < row_ptr[idx + 1]; e++)
+        {
+            int neighbor = col_idx[e];
+            int coarse_neighbor = vertex_map[neighbor];
+
+            if (coarse_v != coarse_neighbor)
+            {
+                atomicAdd(&degree_count[coarse_v], 1);
+            }
+        }
+    }
+}
+
+__global__ void initialize_matching_arrays(int *match, int *vertex_weights, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        match[idx] = -1;
+        vertex_weights[idx] = 1;
+    }
+}
+
+__global__ void heavy_edge_matching_phase1(int *row_ptr, int *col_idx, int *edge_weights,
+                                           int *match, int *proposals, curandState *states, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n && match[idx] == -1)
+    {
+        int best_neighbor = -1;
+        int max_weight = -1;
+
+        // Find heaviest unmatched neighbor
+        for (int e = row_ptr[idx]; e < row_ptr[idx + 1]; e++)
+        {
+            int neighbor = col_idx[e];
+            int weight = edge_weights[e];
+
+            if (neighbor != idx && match[neighbor] == -1 && weight > max_weight)
+            {
+                max_weight = weight;
+                best_neighbor = neighbor;
+            }
+        }
+
+        proposals[idx] = best_neighbor;
+    }
+    else
+    {
+        proposals[idx] = -1;
+    }
+}
+
+__global__ void heavy_edge_matching_phase2(int *proposals, int *match, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        int proposed_neighbor = proposals[idx];
+        if (proposed_neighbor != -1 && proposals[proposed_neighbor] == idx)
+        {
+            // Mutual proposal - create match
+            if (idx < proposed_neighbor)
+            {
+                match[idx] = proposed_neighbor;
+                match[proposed_neighbor] = idx;
+            }
+        }
+    }
+}
+
+__global__ void compute_coarse_vertex_mapping(int *match, int *vertex_map, int *coarse_vertex_count, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        if (match[idx] == -1)
+        {
+            // Unmatched vertex gets its own new vertex ID
+            vertex_map[idx] = atomicAdd(coarse_vertex_count, 1);
+        }
+        else if (idx < match[idx])
+        {
+            // For matched pair, smaller ID gets the new vertex ID
+            int new_id = atomicAdd(coarse_vertex_count, 1);
+            vertex_map[idx] = new_id;
+            vertex_map[match[idx]] = new_id;
+        }
+    }
+}
+
+__global__ void count_coarse_edges(int *row_ptr, int *col_idx, int *vertex_map,
+                                   int *coarse_edge_count, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        int coarse_v = vertex_map[idx];
+
+        for (int e = row_ptr[idx]; e < row_ptr[idx + 1]; e++)
+        {
+            int neighbor = col_idx[e];
+            int coarse_neighbor = vertex_map[neighbor];
+
+            if (coarse_v != coarse_neighbor)
+            {
+                atomicAdd(coarse_edge_count, 1);
+            }
+        }
+    }
+}
+
+__global__ void build_coarse_graph_structure(int *old_row_ptr, int *old_col_idx, int *old_edge_weights,
+                                             int *vertex_map, int old_n, int coarse_n,
+                                             int *new_row_ptr, int *edge_positions, int *temp_edges,
+                                             int *temp_weights, int *temp_neighbors)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < old_n)
+    {
+        int coarse_v = vertex_map[idx];
+
+        for (int e = old_row_ptr[idx]; e < old_row_ptr[idx + 1]; e++)
+        {
+            int neighbor = old_col_idx[e];
+            int coarse_neighbor = vertex_map[neighbor];
+            int weight = old_edge_weights[e];
+
+            if (coarse_v != coarse_neighbor)
+            {
+                int pos = atomicAdd(&edge_positions[coarse_v], 1);
+                int global_pos = new_row_ptr[coarse_v] + pos;
+
+                temp_neighbors[global_pos] = coarse_neighbor;
+                temp_weights[global_pos] = weight;
+            }
+        }
+    }
+}
+
+__global__ void merge_parallel_edges(int *row_ptr, int *col_idx, int *edge_weights,
+                                     int *new_col_idx, int *new_edge_weights, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        int start = row_ptr[idx];
+        int end = row_ptr[idx + 1];
+        int degree = end - start;
+
+        if (degree > 0)
+        {
+            // Sort edges by neighbor ID (simple bubble sort for small degrees)
+            for (int i = 0; i < degree - 1; i++)
+            {
+                for (int j = start; j < start + degree - 1 - i; j++)
+                {
+                    if (col_idx[j] > col_idx[j + 1])
+                    {
+                        // Swap neighbors
+                        int temp_neighbor = col_idx[j];
+                        col_idx[j] = col_idx[j + 1];
+                        col_idx[j + 1] = temp_neighbor;
+
+                        // Swap weights
+                        int temp_weight = edge_weights[j];
+                        edge_weights[j] = edge_weights[j + 1];
+                        edge_weights[j + 1] = temp_weight;
+                    }
+                }
+            }
+
+            // Merge parallel edges
+            int write_pos = start;
+            for (int read_pos = start; read_pos < end; read_pos++)
+            {
+                if (write_pos == start || col_idx[read_pos] != col_idx[write_pos - 1])
+                {
+                    // New unique neighbor
+                    col_idx[write_pos] = col_idx[read_pos];
+                    edge_weights[write_pos] = edge_weights[read_pos];
+                    write_pos++;
+                }
+                else
+                {
+                    // Parallel edge - add weight to previous
+                    edge_weights[write_pos - 1] += edge_weights[read_pos];
+                }
+            }
+
+            // Update row pointer for next vertex
+            if (idx < n - 1)
+            {
+                row_ptr[idx + 1] = write_pos;
+            }
+        }
+    }
+}
+
+__global__ void compute_vertex_weights_coarse(int *match, int *old_vertex_weights,
+                                              int *new_vertex_weights, int *vertex_map, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        int coarse_v = vertex_map[idx];
+        atomicAdd(&new_vertex_weights[coarse_v], old_vertex_weights[idx]);
+    }
+}
+
+// Utility kernel for parallel prefix sum (simplified version)
+__global__ void parallel_prefix_sum(int *input, int *output, int n)
+{
+    extern __shared__ int temp[];
+    int tid = threadIdx.x;
+    int offset = 1;
+
+    // Load input into shared memory
+    if (blockIdx.x * blockDim.x + tid < n)
+    {
+        temp[2 * tid] = input[2 * blockIdx.x * blockDim.x + 2 * tid];
+        temp[2 * tid + 1] = input[2 * blockIdx.x * blockDim.x + 2 * tid + 1];
+    }
+    else
+    {
+        temp[2 * tid] = 0;
+        temp[2 * tid + 1] = 0;
+    }
+
+    // Build sum in place up the tree
+    for (int d = blockDim.x; d > 0; d >>= 1)
+    {
+        __syncthreads();
+        if (tid < d)
+        {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            temp[bi] += temp[ai];
+        }
+        offset *= 2;
+    }
+
+    // Clear the last element
+    if (tid == 0)
+        temp[2 * blockDim.x - 1] = 0;
+
+    // Traverse down tree & build scan
+    for (int d = 1; d < 2 * blockDim.x; d *= 2)
+    {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d)
+        {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            int t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+        }
+    }
+    __syncthreads();
+
+    // Write results to device memory
+    if (2 * blockIdx.x * blockDim.x + 2 * tid < n)
+    {
+        output[2 * blockIdx.x * blockDim.x + 2 * tid] = temp[2 * tid];
+    }
+    if (2 * blockIdx.x * blockDim.x + 2 * tid + 1 < n)
+    {
+        output[2 * blockIdx.x * blockDim.x + 2 * tid + 1] = temp[2 * tid + 1];
+    }
+}
+
 template <typename RandomIt>
 void simple_random_shuffle(RandomIt first, RandomIt last)
 {
@@ -400,173 +685,143 @@ Partition ImprovedGPUNestedDissection::direct_partition(const Graph &graph, cons
 
 // Heavy edge matching for coarsening (currently simplified to avoid segfaults)
 
+// Replace the existing coarsen_graph function in nested_dissection.cu
 std::pair<Graph, std::vector<int>> ImprovedGPUNestedDissection::coarsen_graph(const Graph &graph)
 {
-    // Host arrays for processing
-    std::vector<int> h_row_ptr(graph.n_vertices + 1);
-    std::vector<int> h_col_idx(graph.n_edges);
-    std::vector<int> h_edge_weights(graph.n_edges);
-    std::vector<int> h_vertex_weights(graph.n_vertices);
+    const int n = graph.n_vertices;
+    const dim3 block(BLOCK_SIZE);
+    const dim3 grid((n + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    // Copy graph to host
-    cudaMemcpy(h_row_ptr.data(), graph.row_ptr,
-               (graph.n_vertices + 1) * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_col_idx.data(), graph.col_idx,
-               graph.n_edges * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_edge_weights.data(), graph.edge_weights,
-               graph.n_edges * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_vertex_weights.data(), graph.vertex_weights,
-               graph.n_vertices * sizeof(int), cudaMemcpyDeviceToHost);
+    // Allocate device memory for matching
+    int *d_proposals, *d_coarse_vertex_count, *d_coarse_edge_count;
+    cudaMalloc(&d_proposals, n * sizeof(int));
+    cudaMalloc(&d_coarse_vertex_count, sizeof(int));
+    cudaMalloc(&d_coarse_edge_count, sizeof(int));
 
-    // Heavy Edge Matching - find the heaviest edge for each vertex
-    std::vector<int> match(graph.n_vertices, -1);
-    std::vector<bool> matched(graph.n_vertices, false);
+    // Initialize matching arrays
+    initialize_matching_arrays<<<grid, block>>>(d_match, d_temp_array, n);
+    cudaDeviceSynchronize();
 
-    // Process vertices in random order for better matching
-    std::vector<int> vertex_order(graph.n_vertices);
-    std::iota(vertex_order.begin(), vertex_order.end(), 0);
+    // Phase 1: Each vertex proposes to its heaviest neighbor
+    heavy_edge_matching_phase1<<<grid, block>>>(
+        graph.row_ptr, graph.col_idx, graph.edge_weights,
+        d_match, d_proposals, d_rand_states, n);
+    cudaDeviceSynchronize();
 
-    // Use modern shuffle instead of deprecated random_shuffle
-    std::random_device rd;
-    std::mt19937 g(rd());
-    std::shuffle(vertex_order.begin(), vertex_order.end(), g);
+    // Phase 2: Create matches from mutual proposals
+    heavy_edge_matching_phase2<<<grid, block>>>(d_proposals, d_match, n);
+    cudaDeviceSynchronize();
 
-    for (int v : vertex_order)
+    // Initialize counters
+    cudaMemset(d_coarse_vertex_count, 0, sizeof(int));
+    cudaMemset(d_coarse_edge_count, 0, sizeof(int));
+
+    // Compute vertex mapping and count coarse vertices
+    compute_coarse_vertex_mapping<<<grid, block>>>(d_match, d_vertex_map, d_coarse_vertex_count, n);
+    cudaDeviceSynchronize();
+
+    // Get coarse vertex count
+    int coarse_n;
+    cudaMemcpy(&coarse_n, d_coarse_vertex_count, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (coarse_n <= 0 || coarse_n >= n)
     {
-        if (matched[v])
-            continue;
+        // Coarsening failed, return original graph
+        std::cout << "  Coarsening failed, returning original graph" << std::endl;
+        cudaFree(d_proposals);
+        cudaFree(d_coarse_vertex_count);
+        cudaFree(d_coarse_edge_count);
 
-        int best_neighbor = -1;
-        int max_weight = -1;
+        // Create identity mapping
+        std::vector<int> identity_map(n);
+        std::iota(identity_map.begin(), identity_map.end(), 0);
 
-        // Find heaviest neighbor that is not matched
-        for (int e = h_row_ptr[v]; e < h_row_ptr[v + 1]; e++)
-        {
-            int neighbor = h_col_idx[e];
-            int weight = h_edge_weights[e];
+        // Deep copy the original graph
+        Graph copy_graph(n, graph.n_edges);
+        cudaMemcpy(copy_graph.row_ptr, graph.row_ptr, (n + 1) * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(copy_graph.col_idx, graph.col_idx, graph.n_edges * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(copy_graph.edge_weights, graph.edge_weights, graph.n_edges * sizeof(int), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(copy_graph.vertex_weights, graph.vertex_weights, n * sizeof(int), cudaMemcpyDeviceToDevice);
 
-            if (!matched[neighbor] && neighbor != v && weight > max_weight)
-            {
-                max_weight = weight;
-                best_neighbor = neighbor;
-            }
-        }
-
-        // Match with best neighbor if found
-        if (best_neighbor != -1)
-        {
-            match[v] = best_neighbor;
-            match[best_neighbor] = v;
-            matched[v] = true;
-            matched[best_neighbor] = true;
-        }
+        return {std::move(copy_graph), identity_map};
     }
 
-    // Create vertex mapping from old to new
-    std::vector<int> vertex_map(graph.n_vertices);
-    int new_vertex_count = 0;
+    // Count edges in coarse graph
+    count_coarse_edges<<<grid, block>>>(graph.row_ptr, graph.col_idx, d_vertex_map, d_coarse_edge_count, n);
+    cudaDeviceSynchronize();
 
-    // First pass: assign new vertex IDs
-    for (int v = 0; v < graph.n_vertices; v++)
-    {
-        if (match[v] == -1)
-        {
-            // Unmatched vertex becomes a new vertex
-            vertex_map[v] = new_vertex_count++;
-        }
-        else if (v < match[v])
-        {
-            // For matched pair, smaller ID represents the new vertex
-            vertex_map[v] = new_vertex_count;
-            vertex_map[match[v]] = new_vertex_count;
-            new_vertex_count++;
-        }
-    }
+    int coarse_edges;
+    cudaMemcpy(&coarse_edges, d_coarse_edge_count, sizeof(int), cudaMemcpyDeviceToHost);
 
-    // Build coarse graph adjacency lists
-    std::vector<std::vector<std::pair<int, int>>> coarse_adj(new_vertex_count);
-    std::vector<int> coarse_vertex_weights(new_vertex_count, 0);
+    // Allocate memory for coarse graph
+    int *d_new_row_ptr, *d_edge_positions, *d_temp_neighbors, *d_temp_weights;
+    cudaMalloc(&d_new_row_ptr, (coarse_n + 1) * sizeof(int));
+    cudaMalloc(&d_edge_positions, coarse_n * sizeof(int));
+    cudaMalloc(&d_temp_neighbors, coarse_edges * sizeof(int));
+    cudaMalloc(&d_temp_weights, coarse_edges * sizeof(int));
 
-    // Process each original vertex
-    for (int v = 0; v < graph.n_vertices; v++)
-    {
-        int new_v = vertex_map[v];
-        coarse_vertex_weights[new_v] += h_vertex_weights[v];
+    // Initialize arrays
+    cudaMemset(d_new_row_ptr, 0, (coarse_n + 1) * sizeof(int));
+    cudaMemset(d_edge_positions, 0, coarse_n * sizeof(int));
 
-        // Add edges from this vertex
-        for (int e = h_row_ptr[v]; e < h_row_ptr[v + 1]; e++)
-        {
-            int neighbor = h_col_idx[e];
-            int new_neighbor = vertex_map[neighbor];
-            int weight = h_edge_weights[e];
+    // First pass: count edges per coarse vertex
+    int *d_degree_count;
+    cudaMalloc(&d_degree_count, coarse_n * sizeof(int));
+    cudaMemset(d_degree_count, 0, coarse_n * sizeof(int));
 
-            // Skip self-loops in coarse graph
-            if (new_v != new_neighbor)
-            {
-                coarse_adj[new_v].push_back({new_neighbor, weight});
-            }
-        }
-    }
+    // Count degrees for each coarse vertex
+    count_coarse_vertex_degrees<<<grid, block>>>(
+        graph.row_ptr, graph.col_idx, d_vertex_map, d_degree_count, n);
+    cudaDeviceSynchronize();
 
-    // Merge parallel edges (sum weights)
-    for (auto &neighbors : coarse_adj)
-    {
-        std::sort(neighbors.begin(), neighbors.end());
-        auto it = neighbors.begin();
-        while (it != neighbors.end())
-        {
-            auto next_it = it + 1;
-            while (next_it != neighbors.end() && next_it->first == it->first)
-            {
-                it->second += next_it->second;
-                next_it = neighbors.erase(next_it);
-            }
-            ++it;
-        }
-    }
+    // Compute prefix sum for row pointers using Thrust
+    thrust::device_ptr<int> degree_ptr(d_degree_count);
+    thrust::device_ptr<int> row_ptr(d_new_row_ptr + 1);
+    thrust::inclusive_scan(degree_ptr, degree_ptr + coarse_n, row_ptr);
 
-    // Count total edges in coarse graph
-    int coarse_edges = 0;
-    for (const auto &neighbors : coarse_adj)
-    {
-        coarse_edges += neighbors.size();
-    }
+    // Build coarse graph structure
+    build_coarse_graph_structure<<<grid, block>>>(
+        graph.row_ptr, graph.col_idx, graph.edge_weights, d_vertex_map, n, coarse_n,
+        d_new_row_ptr, d_edge_positions, d_temp_neighbors, d_temp_weights, d_temp_neighbors);
+    cudaDeviceSynchronize();
 
-    // Create coarse graph in CSR format
-    Graph coarse_graph(new_vertex_count, coarse_edges);
-    std::vector<int> coarse_row_ptr(new_vertex_count + 1, 0);
-    std::vector<int> coarse_col_idx(coarse_edges);
-    std::vector<int> coarse_edge_weights(coarse_edges);
+    // Create final coarse graph
+    Graph coarse_graph(coarse_n, coarse_edges);
 
-    int edge_pos = 0;
-    for (int v = 0; v < new_vertex_count; v++)
-    {
-        coarse_row_ptr[v] = edge_pos;
-        for (auto [neighbor, weight] : coarse_adj[v])
-        {
-            coarse_col_idx[edge_pos] = neighbor;
-            coarse_edge_weights[edge_pos] = weight;
-            edge_pos++;
-        }
-    }
-    coarse_row_ptr[new_vertex_count] = edge_pos;
+    // Copy row pointers
+    cudaMemcpy(coarse_graph.row_ptr, d_new_row_ptr, (coarse_n + 1) * sizeof(int), cudaMemcpyDeviceToDevice);
 
-    // Copy to device
-    cudaMemcpy(coarse_graph.row_ptr, coarse_row_ptr.data(),
-               (new_vertex_count + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(coarse_graph.col_idx, coarse_col_idx.data(),
-               coarse_edges * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(coarse_graph.edge_weights, coarse_edge_weights.data(),
-               coarse_edges * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(coarse_graph.vertex_weights, coarse_vertex_weights.data(),
-               new_vertex_count * sizeof(int), cudaMemcpyHostToDevice);
+    // Merge parallel edges and sort
+    const dim3 coarse_grid((coarse_n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    merge_parallel_edges<<<coarse_grid, block>>>(
+        coarse_graph.row_ptr, d_temp_neighbors, d_temp_weights,
+        coarse_graph.col_idx, coarse_graph.edge_weights, coarse_n);
+    cudaDeviceSynchronize();
 
-    std::cout << "  Coarsened from " << graph.n_vertices << " to "
-              << new_vertex_count << " vertices (reduction: "
-              << (100.0 * (graph.n_vertices - new_vertex_count) / graph.n_vertices)
-              << "%)" << std::endl;
+    // Compute coarse vertex weights
+    cudaMemset(coarse_graph.vertex_weights, 0, coarse_n * sizeof(int));
+    compute_vertex_weights_coarse<<<grid, block>>>(
+        d_match, graph.vertex_weights, coarse_graph.vertex_weights, d_vertex_map, n);
+    cudaDeviceSynchronize();
 
-    return {std::move(coarse_graph), vertex_map};
+    // Copy vertex mapping to host
+    std::vector<int> vertex_mapping(n);
+    cudaMemcpy(vertex_mapping.data(), d_vertex_map, n * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Cleanup
+    cudaFree(d_proposals);
+    cudaFree(d_coarse_vertex_count);
+    cudaFree(d_coarse_edge_count);
+    cudaFree(d_new_row_ptr);
+    cudaFree(d_edge_positions);
+    cudaFree(d_temp_neighbors);
+    cudaFree(d_temp_weights);
+    cudaFree(d_degree_count);
+
+    std::cout << "  GPU Coarsened from " << n << " to " << coarse_n << " vertices (reduction: "
+              << (100.0 * (n - coarse_n) / n) << "%)" << std::endl;
+
+    return {std::move(coarse_graph), vertex_mapping};
 }
 
 // Graph-based partitioning using BFS + edge cutting
