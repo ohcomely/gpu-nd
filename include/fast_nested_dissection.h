@@ -72,6 +72,7 @@ struct SeparatorNode
 class FastNestedDissection
 {
 private:
+    cudaStream_t computation_stream = 0;
     cusparseHandle_t cusparse_handle;
     cublasHandle_t cublas_handle;
 
@@ -122,6 +123,16 @@ public:
                               const std::vector<int> &vertices);
     std::vector<int> partitionByEigenvector(const std::vector<int> &vertices,
                                             const thrust::device_vector<double> &eigenvec);
+
+    void createSubgraphMapping(const std::vector<int> &vertices,
+                               thrust::device_vector<int> &d_vertex_map,
+                               thrust::device_vector<int> &d_reverse_map);
+    void performSpMVSubgraph(const thrust::device_vector<double> &d_x,
+                             thrust::device_vector<double> &d_y,
+                             const std::vector<int> &vertices);
+
+    std::pair<std::vector<int>, std::vector<int>> gpuConnectedComponents(
+        const std::vector<int> &remaining, const std::vector<int> &separator);
 
 public:
     // Constructors
@@ -186,3 +197,19 @@ __global__ void computeVertexCoordinates(const int *row_ptr, const int *col_idx,
 __global__ void spectralMatVec(const int *row_ptr, const int *col_idx, const double *values,
                                const double *x, double *y, int n);
 __device__ void atomicAddDouble(double *address, double val);
+
+__global__ void sparseMatVec(const int *row_ptr, const int *col_idx,
+                             const double *values, const double *x,
+                             double *y, int n);
+__global__ void sparseMatVecSubgraph(const int *row_ptr, const int *col_idx,
+                                     const double *values, const double *x,
+                                     double *y, const int *vertex_map,
+                                     const int *reverse_map, int sub_n, int n);
+
+__global__ void initializeLabels(int *labels, int n);
+__global__ void propagateLabels(const int *row_ptr, const int *col_idx,
+                                int *labels, bool *changed,
+                                const int *separator_mask, int n);
+__global__ void extractComponent(const int *labels, const int *vertices,
+                                 int *component_vertices, int *component_size,
+                                 int target_label, int num_vertices);

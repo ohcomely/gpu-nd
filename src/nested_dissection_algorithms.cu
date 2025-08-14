@@ -47,7 +47,8 @@ void FastNestedDissection::buildNestedDissectionTreeFast()
         Task current = task_queue.front();
         task_queue.pop();
 
-        if (current.vertices.size() <= 128)
+        int base_case_size = (n > 100000) ? 512 : 128;
+        if (current.vertices.size() <= base_case_size)
         { // Larger base case
             current.node->vertices = current.vertices;
             continue;
@@ -71,7 +72,7 @@ void FastNestedDissection::buildNestedDissectionTreeFast()
         current.node->vertices = separator;
 
         // Fast connected components
-        std::pair<std::vector<int>, std::vector<int>> components = fastConnectedComponents(current.vertices, separator);
+        std::pair<std::vector<int>, std::vector<int>> components = gpuConnectedComponents(current.vertices, separator);
         std::vector<int> A_vertices = components.first;
         std::vector<int> B_vertices = components.second;
 

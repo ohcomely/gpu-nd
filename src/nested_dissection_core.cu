@@ -119,6 +119,99 @@ __global__ void geometricSeparator2D(int *separator_mask, int grid_size,
     }
 }
 
+__global__ void sparseMatVec(const int *row_ptr, const int *col_idx,
+                             const double *values, const double *x,
+                             double *y, int n)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < n)
+    {
+        double sum = 0.0;
+        for (int j = row_ptr[row]; j < row_ptr[row + 1]; j++)
+        {
+            sum += values[j] * x[col_idx[j]];
+        }
+        y[row] = sum;
+    }
+}
+
+__global__ void sparseMatVecSubgraph(const int *row_ptr, const int *col_idx,
+                                     const double *values, const double *x,
+                                     double *y, const int *vertex_map,
+                                     const int *reverse_map, int sub_n, int n)
+{
+    int local_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_row < sub_n)
+    {
+        int global_row = vertex_map[local_row];
+        double sum = 0.0;
+
+        for (int j = row_ptr[global_row]; j < row_ptr[global_row + 1]; j++)
+        {
+            int neighbor = col_idx[j];
+            int local_neighbor = reverse_map[neighbor];
+            if (local_neighbor != -1)
+            { // neighbor is in subgraph
+                sum += values[j] * x[local_neighbor];
+            }
+        }
+        y[local_row] = sum;
+    }
+}
+
+__global__ void initializeLabels(int *labels, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        labels[idx] = idx;
+    }
+}
+
+__global__ void propagateLabels(const int *row_ptr, const int *col_idx,
+                                int *labels, bool *changed,
+                                const int *separator_mask, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n && separator_mask[idx] == 0)
+    { // Not in separator
+        int current_label = labels[idx];
+        int min_label = current_label;
+
+        // Check all neighbors
+        for (int j = row_ptr[idx]; j < row_ptr[idx + 1]; j++)
+        {
+            int neighbor = col_idx[j];
+            if (separator_mask[neighbor] == 0)
+            { // Neighbor not in separator
+                min_label = min(min_label, labels[neighbor]);
+            }
+        }
+
+        if (min_label < current_label)
+        {
+            labels[idx] = min_label;
+            *changed = true;
+        }
+    }
+}
+
+__global__ void extractComponent(const int *labels, const int *vertices,
+                                 int *component_vertices, int *component_size,
+                                 int target_label, int num_vertices)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_vertices)
+    {
+        int vertex = vertices[idx];
+        if (labels[vertex] == target_label)
+        {
+            int pos = atomicAdd(component_size, 1);
+            component_vertices[pos] = vertex;
+        }
+    }
+}
+
 __device__ void atomicAddDouble(double *address, double val)
 {
     unsigned long long int *address_as_ull = (unsigned long long int *)address;
@@ -232,7 +325,8 @@ std::vector<int> FastNestedDissection::approximateSpectralSeparator(const std::v
     thrust::fill(d_x.begin(), d_x.end(), 1.0);
 
     // Only 20 iterations instead of 100
-    for (int iter = 0; iter < 20; iter++)
+    int max_iterations = (sub_n > 100000) ? 5 : 10;
+    for (int iter = 0; iter < max_iterations; iter++)
     {
         // Simplified power iteration without full Laplacian construction
         // Just use degree-weighted random walk
@@ -265,9 +359,7 @@ void FastNestedDissection::simpleRandomWalkStep(thrust::device_vector<double> &d
                                                 thrust::device_vector<double> &d_y,
                                                 const std::vector<int> &vertices)
 {
-    // This is a simplified placeholder - in practice you'd implement
-    // a fast sparse matrix-vector multiply here
-    thrust::copy(d_x.begin(), d_x.end(), d_y.begin());
+    performSpMVSubgraph(d_x, d_y, vertices);
 }
 
 std::vector<int> FastNestedDissection::partitionByEigenvector(const std::vector<int> &vertices,
@@ -299,7 +391,8 @@ std::vector<int> FastNestedDissection::partitionByEigenvector(const std::vector<
     return separator;
 }
 
-FastNestedDissection::FastNestedDissection(const MetisGraph &graph) : n(graph.n), nnz(0), is_structured_grid(false), grid_size(0)
+FastNestedDissection::FastNestedDissection(const MetisGraph &graph)
+    : n(graph.n), nnz(0), is_structured_grid(false), grid_size(0)
 {
     CUSPARSE_CHECK(cusparseCreate(&cusparse_handle));
     cublasStatus_t cublas_status = cublasCreate(&cublas_handle);
@@ -312,10 +405,11 @@ FastNestedDissection::FastNestedDissection(const MetisGraph &graph) : n(graph.n)
     d_perm.resize(n);
     thrust::sequence(d_perm.begin(), d_perm.end());
 
-    // Pre-allocate workspace
-    workspace_vec1.resize(n);
-    workspace_vec2.resize(n);
-    workspace_int.resize(n);
+    // Large workspace allocation for big matrices
+    int workspace_size = std::max(n, 1000000); // At least 1M elements
+    workspace_vec1.resize(workspace_size);
+    workspace_vec2.resize(workspace_size);
+    workspace_int.resize(workspace_size);
 
     // Load the METIS graph
     loadMetisGraph(graph);
@@ -331,6 +425,34 @@ FastNestedDissection::FastNestedDissection(const MetisGraph &graph) : n(graph.n)
     else
     {
         std::cout << "General unstructured graph detected" << std::endl;
+    }
+
+    // Memory optimization and CUDA hints for large matrices
+    if (n > 100000)
+    {
+        // Set memory advice for read-mostly data
+        cudaMemAdvise(thrust::raw_pointer_cast(d_row_ptr.data()),
+                      d_row_ptr.size() * sizeof(int),
+                      cudaMemAdviseSetReadMostly, 0);
+        cudaMemAdvise(thrust::raw_pointer_cast(d_col_idx.data()),
+                      d_col_idx.size() * sizeof(int),
+                      cudaMemAdviseSetReadMostly, 0);
+
+        // Enable GPU memory prefetching for large datasets
+        cudaMemPrefetchAsync(thrust::raw_pointer_cast(d_row_ptr.data()),
+                             d_row_ptr.size() * sizeof(int), 0, 0);
+        cudaMemPrefetchAsync(thrust::raw_pointer_cast(d_col_idx.data()),
+                             d_col_idx.size() * sizeof(int), 0, 0);
+
+        std::cout << "Large matrix mode: optimized for n=" << n
+                  << ", nnz=" << nnz << std::endl;
+    }
+
+    // Set CUDA stream for better async performance
+    if (n > 500000)
+    {
+        cudaStreamCreate(&computation_stream);
+        std::cout << "Very large matrix: using dedicated CUDA stream" << std::endl;
     }
 }
 
@@ -638,4 +760,135 @@ std::vector<int> FastNestedDissection::improvedSpectralSeparator(const std::vect
 {
     // Enhanced spectral separator with better power iteration
     return approximateSpectralSeparator(vertices); // Use existing implementation for now
+}
+
+void FastNestedDissection::createSubgraphMapping(const std::vector<int> &vertices,
+                                                 thrust::device_vector<int> &d_vertex_map,
+                                                 thrust::device_vector<int> &d_reverse_map)
+{
+    d_vertex_map.resize(vertices.size());
+    d_reverse_map.resize(n);
+
+    // Initialize reverse map to -1
+    thrust::fill(d_reverse_map.begin(), d_reverse_map.end(), -1);
+
+    // Set up mappings
+    thrust::copy(vertices.begin(), vertices.end(), d_vertex_map.begin());
+
+    // Create reverse mapping on GPU
+    thrust::for_each(thrust::make_counting_iterator(0),
+                     thrust::make_counting_iterator((int)vertices.size()),
+                     [d_vertex_map_ptr = thrust::raw_pointer_cast(d_vertex_map.data()),
+                      d_reverse_map_ptr = thrust::raw_pointer_cast(d_reverse_map.data())] __device__(int i)
+                     {
+                         d_reverse_map_ptr[d_vertex_map_ptr[i]] = i;
+                     });
+}
+
+void FastNestedDissection::performSpMVSubgraph(const thrust::device_vector<double> &d_x,
+                                               thrust::device_vector<double> &d_y,
+                                               const std::vector<int> &vertices)
+{
+    int sub_n = vertices.size();
+
+    // Create mapping between subgraph and global indices
+    thrust::device_vector<int> d_vertex_map, d_reverse_map;
+    createSubgraphMapping(vertices, d_vertex_map, d_reverse_map);
+
+    int blockSize = 256;
+    int gridSize = (sub_n + blockSize - 1) / blockSize;
+
+    sparseMatVecSubgraph<<<gridSize, blockSize>>>(
+        thrust::raw_pointer_cast(d_row_ptr.data()),
+        thrust::raw_pointer_cast(d_col_idx.data()),
+        thrust::raw_pointer_cast(d_values.data()),
+        thrust::raw_pointer_cast(d_x.data()),
+        thrust::raw_pointer_cast(d_y.data()),
+        thrust::raw_pointer_cast(d_vertex_map.data()),
+        thrust::raw_pointer_cast(d_reverse_map.data()),
+        sub_n, n);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+std::pair<std::vector<int>, std::vector<int>> FastNestedDissection::gpuConnectedComponents(
+    const std::vector<int> &remaining, const std::vector<int> &separator)
+{
+
+    // Create separator mask on GPU
+    thrust::device_vector<int> d_separator_mask(n, 0);
+
+    // Mark separator vertices
+    for (int v : separator)
+    {
+        d_separator_mask[v] = 1;
+    }
+
+    // Initialize labels for connected components
+    thrust::device_vector<int> d_labels(n);
+    thrust::device_vector<bool> d_changed(1);
+
+    int blockSize = 256;
+    int gridSize = (n + blockSize - 1) / blockSize;
+
+    // Initialize each vertex with its own label
+    initializeLabels<<<gridSize, blockSize>>>(
+        thrust::raw_pointer_cast(d_labels.data()), n);
+
+    // Label propagation for connected components
+    int max_iterations = 50; // Limit iterations for speed
+    for (int iter = 0; iter < max_iterations; iter++)
+    {
+        thrust::fill(d_changed.begin(), d_changed.end(), false);
+
+        propagateLabels<<<gridSize, blockSize>>>(
+            thrust::raw_pointer_cast(d_row_ptr.data()),
+            thrust::raw_pointer_cast(d_col_idx.data()),
+            thrust::raw_pointer_cast(d_labels.data()),
+            thrust::raw_pointer_cast(d_changed.data()),
+            thrust::raw_pointer_cast(d_separator_mask.data()), n);
+
+        thrust::host_vector<bool> h_changed = d_changed;
+        if (!h_changed[0])
+            break;
+    }
+
+    // Extract the two largest components
+    thrust::host_vector<int> h_labels = d_labels;
+    std::unordered_map<int, std::vector<int>> components;
+
+    for (int v : remaining)
+    {
+        if (std::find(separator.begin(), separator.end(), v) == separator.end())
+        {
+            components[h_labels[v]].push_back(v);
+        }
+    }
+
+    // Find two largest components
+    std::vector<std::pair<int, std::vector<int>>> sorted_components;
+    for (auto &comp : components)
+    {
+        sorted_components.push_back({comp.second.size(), comp.second});
+    }
+
+    std::sort(sorted_components.begin(), sorted_components.end(),
+              [](const auto &a, const auto &b)
+              { return a.first > b.first; });
+
+    std::vector<int> A_vertices, B_vertices;
+    if (sorted_components.size() >= 1)
+        A_vertices = sorted_components[0].second;
+    if (sorted_components.size() >= 2)
+        B_vertices = sorted_components[1].second;
+
+    // If we only have one component, split it roughly in half for speed
+    if (B_vertices.empty() && !A_vertices.empty())
+    {
+        int mid = A_vertices.size() / 2;
+        B_vertices.assign(A_vertices.begin() + mid, A_vertices.end());
+        A_vertices.resize(mid);
+    }
+
+    return std::make_pair(A_vertices, B_vertices);
 }
