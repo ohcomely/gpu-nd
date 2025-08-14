@@ -111,6 +111,7 @@ private:
     std::vector<int> geometricSeparatorGeneral(const std::vector<int> &vertices);
     std::vector<int> multilevelSeparator(const std::vector<int> &vertices);
     std::vector<int> improvedSpectralSeparator(const std::vector<int> &vertices);
+    std::vector<int> fastDegreeSeparator(const std::vector<int> &vertices);
 
 public:
     // Separator methods that need device lambda access

@@ -324,8 +324,9 @@ std::vector<int> FastNestedDissection::approximateSpectralSeparator(const std::v
 
     thrust::fill(d_x.begin(), d_x.end(), 1.0);
 
-    // Only 20 iterations instead of 100
-    int max_iterations = (sub_n > 100000) ? 5 : 10;
+    // int max_iterations = (sub_n > 100000) ? 5 : 10;
+    int max_iterations = (sub_n > 10000) ? 3 : (sub_n > 1000) ? 5
+                                                              : 10;
     for (int iter = 0; iter < max_iterations; iter++)
     {
         // Simplified power iteration without full Laplacian construction
@@ -891,4 +892,50 @@ std::pair<std::vector<int>, std::vector<int>> FastNestedDissection::gpuConnected
     }
 
     return std::make_pair(A_vertices, B_vertices);
+}
+
+std::vector<int> FastNestedDissection::fastDegreeSeparator(const std::vector<int> &vertices)
+{
+    int sub_n = vertices.size();
+
+    if (sub_n <= 32)
+    {
+        return std::vector<int>{vertices[sub_n / 2]};
+    }
+
+    thrust::host_vector<int> h_row_ptr = d_row_ptr;
+
+    // For large subgraphs, use degree-based separator (much faster than spectral)
+    if (sub_n > 1000)
+    {
+        std::vector<std::pair<int, int>> degree_pairs;
+        degree_pairs.reserve(sub_n);
+
+        for (int v : vertices)
+        {
+            int degree = h_row_ptr[v + 1] - h_row_ptr[v];
+            degree_pairs.emplace_back(degree, v);
+        }
+
+        // Sort by degree descending - high degree vertices are good separators
+        std::partial_sort(degree_pairs.begin(),
+                          degree_pairs.begin() + std::min(sub_n / 20, 100),
+                          degree_pairs.end(),
+                          std::greater<std::pair<int, int>>());
+
+        // Take top vertices as separator
+        int sep_size = std::max(1, std::min(sub_n / 50, 100));
+        std::vector<int> separator;
+        separator.reserve(sep_size);
+
+        for (int i = 0; i < sep_size; i++)
+        {
+            separator.push_back(degree_pairs[i].second);
+        }
+
+        return separator;
+    }
+
+    // For medium subgraphs, use spectral
+    return approximateSpectralSeparator(vertices);
 }

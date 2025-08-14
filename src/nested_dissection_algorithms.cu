@@ -19,10 +19,16 @@
 // Tree building and algorithms implementation
 void FastNestedDissection::buildNestedDissectionTreeFast()
 {
+    auto timer_start = std::chrono::high_resolution_clock::now();
     std::vector<int> all_vertices(n);
     std::iota(all_vertices.begin(), all_vertices.end(), 0);
 
     separator_tree = std::make_unique<SeparatorNode>(0);
+
+    auto setup_time = std::chrono::high_resolution_clock::now();
+    std::cout << "Setup time: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(setup_time - timer_start).count()
+              << " ms" << std::endl;
 
     // Use iterative approach with queue for better cache locality
     struct Task
@@ -42,18 +48,24 @@ void FastNestedDissection::buildNestedDissectionTreeFast()
     initial_task.height = grid_size;
     task_queue.push(initial_task);
 
+    int iteration_count = 0;
+    int total_separator_time = 0;
+    int total_components_time = 0;
+
     while (!task_queue.empty())
     {
         Task current = task_queue.front();
         task_queue.pop();
-
-        int base_case_size = (n > 100000) ? 512 : 128;
+        iteration_count++;
+        // int base_case_size = std::max(2048, n / 256);
+        int base_case_size = 512;
         if (current.vertices.size() <= base_case_size)
         { // Larger base case
             current.node->vertices = current.vertices;
             continue;
         }
 
+        auto sep_start = std::chrono::high_resolution_clock::now();
         // Fast separator finding
         std::vector<int> separator;
         if (grid_size > 0 && current.width > 8 && current.height > 8)
@@ -69,10 +81,16 @@ void FastNestedDissection::buildNestedDissectionTreeFast()
             separator = approximateSpectralSeparator(current.vertices);
         }
 
+        auto sep_end = std::chrono::high_resolution_clock::now();
+        total_separator_time += std::chrono::duration_cast<std::chrono::milliseconds>(sep_end - sep_start).count();
+
         current.node->vertices = separator;
 
         // Fast connected components
-        std::pair<std::vector<int>, std::vector<int>> components = gpuConnectedComponents(current.vertices, separator);
+        auto comp_start = std::chrono::high_resolution_clock::now();
+        std::pair<std::vector<int>, std::vector<int>> components = fastConnectedComponents(current.vertices, separator);
+        auto comp_end = std::chrono::high_resolution_clock::now();
+        total_components_time += std::chrono::duration_cast<std::chrono::milliseconds>(comp_end - comp_start).count();
         std::vector<int> A_vertices = components.first;
         std::vector<int> B_vertices = components.second;
 
@@ -106,6 +124,9 @@ void FastNestedDissection::buildNestedDissectionTreeFast()
             task_queue.push(right_task);
         }
     }
+    std::cout << "Total iterations: " << iteration_count << std::endl;
+    std::cout << "Total separator time: " << total_separator_time << " ms" << std::endl;
+    std::cout << "Total components time: " << total_components_time << " ms" << std::endl;
 }
 
 std::pair<std::vector<int>, std::vector<int>> FastNestedDissection::fastConnectedComponents(
@@ -114,13 +135,13 @@ std::pair<std::vector<int>, std::vector<int>> FastNestedDissection::fastConnecte
     std::unordered_set<int> sep_set(separator.begin(), separator.end());
     std::vector<int> A_vertices, B_vertices;
 
-    // Simple alternating assignment for speed (quality trade-off)
-    bool assign_to_A = true;
+    // Remove separator vertices and split remaining vertices
     for (int v : remaining)
     {
         if (sep_set.find(v) == sep_set.end())
         {
-            if (assign_to_A)
+            // Use simple hash-based partitioning for speed
+            if ((v ^ (v >> 16)) & 1)
             {
                 A_vertices.push_back(v);
             }
@@ -128,7 +149,6 @@ std::pair<std::vector<int>, std::vector<int>> FastNestedDissection::fastConnecte
             {
                 B_vertices.push_back(v);
             }
-            assign_to_A = !assign_to_A;
         }
     }
 
