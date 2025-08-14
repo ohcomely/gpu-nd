@@ -1,0 +1,144 @@
+#pragma once
+
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <cublas_v2.h>
+#include <cusolverSp.h>
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <vector>
+#include <memory>
+#include <utility>
+
+// Error checking macros
+#define CUDA_CHECK(call)                                                                               \
+    do                                                                                                 \
+    {                                                                                                  \
+        cudaError_t err = call;                                                                        \
+        if (err != cudaSuccess)                                                                        \
+        {                                                                                              \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(1);                                                                                   \
+        }                                                                                              \
+    } while (0)
+
+#define CUSPARSE_CHECK(call)                                                           \
+    do                                                                                 \
+    {                                                                                  \
+        cusparseStatus_t err = call;                                                   \
+        if (err != CUSPARSE_STATUS_SUCCESS)                                            \
+        {                                                                              \
+            fprintf(stderr, "cuSPARSE error at %s:%d: %d\n", __FILE__, __LINE__, err); \
+            exit(1);                                                                   \
+        }                                                                              \
+    } while (0)
+
+// Forward declarations
+class GPUMemoryPool;
+struct SeparatorNode;
+class QualityMetrics;
+
+// GPU Memory Pool for optimization
+class GPUMemoryPool
+{
+private:
+    std::vector<void *> free_blocks;
+    std::vector<size_t> block_sizes;
+    size_t total_allocated = 0;
+
+public:
+    void *allocate(size_t size);
+    void deallocate(void *ptr, size_t size);
+    ~GPUMemoryPool();
+};
+
+extern GPUMemoryPool memory_pool;
+
+// Separator tree node structure
+struct SeparatorNode
+{
+    std::vector<int> vertices;
+    std::vector<int> A_vertices;
+    std::vector<int> B_vertices;
+    std::unique_ptr<SeparatorNode> left;
+    std::unique_ptr<SeparatorNode> right;
+    int level;
+
+    SeparatorNode(int lvl = 0);
+};
+
+// Main nested dissection class
+class FastNestedDissection
+{
+private:
+    cusparseHandle_t cusparse_handle;
+    cublasHandle_t cublas_handle;
+
+    int n;
+    int nnz;
+    int grid_size; // For 2D grid optimization
+
+    thrust::device_vector<int> d_row_ptr;
+    thrust::device_vector<int> d_col_idx;
+    thrust::device_vector<double> d_values;
+
+    std::unique_ptr<SeparatorNode> separator_tree;
+    thrust::device_vector<int> d_perm;
+
+    // Reusable GPU buffers
+    thrust::device_vector<double> workspace_vec1;
+    thrust::device_vector<double> workspace_vec2;
+    thrust::device_vector<int> workspace_int;
+
+    // Private methods (without device lambdas)
+    void buildNestedDissectionTreeFast();
+    std::pair<std::vector<int>, std::vector<int>> fastConnectedComponents(
+        const std::vector<int> &remaining, const std::vector<int> &separator);
+    void generatePermutationRecursive(SeparatorNode *node, std::vector<int> &permutation);
+    void printTreeRecursive(SeparatorNode *node, std::string indent);
+
+    // Public methods (needed for device lambdas)
+public:
+    std::vector<int> fastGeometricSeparator(const std::vector<int> &vertices,
+                                            int start_x, int start_y, int width, int height);
+    std::vector<int> approximateSpectralSeparator(const std::vector<int> &vertices);
+    void simpleRandomWalkStep(thrust::device_vector<double> &d_x,
+                              thrust::device_vector<double> &d_y,
+                              const std::vector<int> &vertices);
+    std::vector<int> partitionByEigenvector(const std::vector<int> &vertices,
+                                            const thrust::device_vector<double> &eigenvec);
+
+public:
+    FastNestedDissection(int matrix_size, int grid_sz = 0);
+    ~FastNestedDissection();
+
+    void loadMatrix(const std::vector<int> &row_ptr,
+                    const std::vector<int> &col_idx,
+                    const std::vector<double> &values);
+    void performNestedDissection();
+    void generatePermutation();
+    std::vector<int> getPermutation();
+    void printTreeInfo();
+};
+
+// Quality improvement metrics
+class QualityMetrics
+{
+public:
+    static double computeSeparatorQuality(const std::vector<int> &separator,
+                                          const std::vector<int> &A_vertices,
+                                          const std::vector<int> &B_vertices);
+    static std::vector<int> refineSeparator(const std::vector<int> &separator,
+                                            const std::vector<int> &A_vertices,
+                                            const std::vector<int> &B_vertices,
+                                            const std::vector<int> &row_ptr,
+                                            const std::vector<int> &col_idx);
+};
+
+// CUDA kernel declarations
+__global__ void computeDegreesShared(const int *row_ptr, int n, int *degrees);
+__global__ void setupLaplacianFused(const int *row_ptr, const int *col_idx,
+                                    double *values, const int *degrees, int n);
+__global__ void geometricSeparator2D(int *separator_mask, int grid_size,
+                                     int start_x, int start_y, int width, int height);
+__device__ void atomicAddDouble(double *address, double val);
