@@ -9,6 +9,7 @@
 #include <vector>
 #include <memory>
 #include <utility>
+#include "metis_parser.h"
 
 // Error checking macros
 #define CUDA_CHECK(call)                                                                               \
@@ -67,7 +68,7 @@ struct SeparatorNode
     SeparatorNode(int lvl = 0);
 };
 
-// Main nested dissection class
+// Main nested dissection class - now supports METIS graphs
 class FastNestedDissection
 {
 private:
@@ -76,11 +77,15 @@ private:
 
     int n;
     int nnz;
-    int grid_size; // For 2D grid optimization
+    bool is_structured_grid; // True for grid graphs, false for general graphs
+    int grid_size;           // Only used for structured grids
 
     thrust::device_vector<int> d_row_ptr;
     thrust::device_vector<int> d_col_idx;
     thrust::device_vector<double> d_values;
+
+    // Store original METIS graph data
+    MetisGraph metis_graph;
 
     std::unique_ptr<SeparatorNode> separator_tree;
     thrust::device_vector<int> d_perm;
@@ -90,17 +95,27 @@ private:
     thrust::device_vector<double> workspace_vec2;
     thrust::device_vector<int> workspace_int;
 
-    // Private methods (without device lambdas)
+    // Private methods
     void buildNestedDissectionTreeFast();
     std::pair<std::vector<int>, std::vector<int>> fastConnectedComponents(
         const std::vector<int> &remaining, const std::vector<int> &separator);
     void generatePermutationRecursive(SeparatorNode *node, std::vector<int> &permutation);
     void printTreeRecursive(SeparatorNode *node, std::string indent);
 
-    // Public methods (needed for device lambdas)
+    // Graph analysis methods
+    bool detectStructuredGrid();
+    std::pair<int, int> estimateGridDimensions();
+
+    // Enhanced separator methods for general graphs
+    std::vector<int> geometricSeparatorGeneral(const std::vector<int> &vertices);
+    std::vector<int> multilevelSeparator(const std::vector<int> &vertices);
+    std::vector<int> improvedSpectralSeparator(const std::vector<int> &vertices);
+
 public:
+    // Separator methods that need device lambda access
     std::vector<int> fastGeometricSeparator(const std::vector<int> &vertices,
-                                            int start_x, int start_y, int width, int height);
+                                            int start_x = 0, int start_y = 0,
+                                            int width = 0, int height = 0);
     std::vector<int> approximateSpectralSeparator(const std::vector<int> &vertices);
     void simpleRandomWalkStep(thrust::device_vector<double> &d_x,
                               thrust::device_vector<double> &d_y,
@@ -109,19 +124,29 @@ public:
                                             const thrust::device_vector<double> &eigenvec);
 
 public:
-    FastNestedDissection(int matrix_size, int grid_sz = 0);
+    // Constructors
+    FastNestedDissection(int matrix_size, int grid_sz = 0); // Original constructor
+    FastNestedDissection(const MetisGraph &graph);          // New METIS constructor
     ~FastNestedDissection();
 
+    // Matrix loading methods
     void loadMatrix(const std::vector<int> &row_ptr,
                     const std::vector<int> &col_idx,
                     const std::vector<double> &values);
+    void loadMetisGraph(const MetisGraph &graph);
+
+    // Main algorithm methods
     void performNestedDissection();
     void generatePermutation();
     std::vector<int> getPermutation();
     void printTreeInfo();
+
+    // Analysis methods
+    void printGraphAnalysis();
+    double computeFillReduction();
 };
 
-// Quality improvement metrics
+// Enhanced quality improvement metrics for general graphs
 class QualityMetrics
 {
 public:
@@ -133,6 +158,21 @@ public:
                                             const std::vector<int> &B_vertices,
                                             const std::vector<int> &row_ptr,
                                             const std::vector<int> &col_idx);
+
+    // New methods for general graphs
+    static double computeBalanceRatio(const std::vector<int> &A_vertices,
+                                      const std::vector<int> &B_vertices);
+    static double computeEdgeCut(const std::vector<int> &separator,
+                                 const std::vector<int> &A_vertices,
+                                 const std::vector<int> &B_vertices,
+                                 const std::vector<int> &row_ptr,
+                                 const std::vector<int> &col_idx);
+    static std::vector<int> kernighanLinRefinement(const std::vector<int> &separator,
+                                                   const std::vector<int> &A_vertices,
+                                                   const std::vector<int> &B_vertices,
+                                                   const std::vector<int> &row_ptr,
+                                                   const std::vector<int> &col_idx,
+                                                   int max_iterations = 10);
 };
 
 // CUDA kernel declarations
@@ -141,4 +181,8 @@ __global__ void setupLaplacianFused(const int *row_ptr, const int *col_idx,
                                     double *values, const int *degrees, int n);
 __global__ void geometricSeparator2D(int *separator_mask, int grid_size,
                                      int start_x, int start_y, int width, int height);
+__global__ void computeVertexCoordinates(const int *row_ptr, const int *col_idx,
+                                         int n, double *x_coords, double *y_coords);
+__global__ void spectralMatVec(const int *row_ptr, const int *col_idx, const double *values,
+                               const double *x, double *y, int n);
 __device__ void atomicAddDouble(double *address, double val);

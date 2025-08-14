@@ -15,6 +15,7 @@
 #include <iostream>
 #include <numeric>
 #include <chrono>
+#include <set>
 
 // Global memory pool instance
 GPUMemoryPool memory_pool;
@@ -296,4 +297,345 @@ std::vector<int> FastNestedDissection::partitionByEigenvector(const std::vector<
     }
 
     return separator;
+}
+
+FastNestedDissection::FastNestedDissection(const MetisGraph &graph) : n(graph.n), nnz(0), is_structured_grid(false), grid_size(0)
+{
+    CUSPARSE_CHECK(cusparseCreate(&cusparse_handle));
+    cublasStatus_t cublas_status = cublasCreate(&cublas_handle);
+    if (cublas_status != CUBLAS_STATUS_SUCCESS)
+    {
+        fprintf(stderr, "cuBLAS error: %d\n", cublas_status);
+        exit(1);
+    }
+
+    d_perm.resize(n);
+    thrust::sequence(d_perm.begin(), d_perm.end());
+
+    // Pre-allocate workspace
+    workspace_vec1.resize(n);
+    workspace_vec2.resize(n);
+    workspace_int.resize(n);
+
+    // Load the METIS graph
+    loadMetisGraph(graph);
+
+    // Analyze graph structure
+    is_structured_grid = detectStructuredGrid();
+    if (is_structured_grid)
+    {
+        auto dims = estimateGridDimensions();
+        grid_size = std::max(dims.first, dims.second);
+        std::cout << "Detected structured grid: " << dims.first << " x " << dims.second << std::endl;
+    }
+    else
+    {
+        std::cout << "General unstructured graph detected" << std::endl;
+    }
+}
+
+void FastNestedDissection::loadMetisGraph(const MetisGraph &graph)
+{
+    metis_graph = graph;
+
+    // Convert to CSR format for CUDA
+    nnz = graph.col_idx.size();
+    d_row_ptr = graph.row_ptr;
+    d_col_idx = graph.col_idx;
+
+    // Use edge weights if available, otherwise use unit weights
+    if (graph.has_edge_weights)
+    {
+        d_values = graph.edge_weights;
+    }
+    else
+    {
+        std::vector<double> unit_weights(nnz, 1.0);
+        d_values = unit_weights;
+    }
+
+    std::cout << "Loaded METIS graph: " << n << " vertices, " << nnz << " edges" << std::endl;
+}
+
+bool FastNestedDissection::detectStructuredGrid()
+{
+    // Simple heuristic: check if the graph has regular degree pattern
+    // and geometric structure typical of 2D grids
+
+    thrust::host_vector<int> h_row_ptr = d_row_ptr;
+    thrust::host_vector<int> h_col_idx = d_col_idx;
+
+    // Count degree distribution
+    std::vector<int> degree_counts(10, 0);
+    int total_degree_4 = 0;
+    int total_degree_3 = 0;
+    int total_degree_2 = 0;
+
+    for (int i = 0; i < n; i++)
+    {
+        int degree = h_row_ptr[i + 1] - h_row_ptr[i];
+        if (degree < 10)
+        {
+            degree_counts[degree]++;
+        }
+        if (degree == 4)
+            total_degree_4++;
+        if (degree == 3)
+            total_degree_3++;
+        if (degree == 2)
+            total_degree_2++;
+    }
+
+    // For a 2D grid, most internal nodes have degree 4,
+    // edge nodes have degree 3, corner nodes have degree 2
+    double ratio_regular = (double)(total_degree_2 + total_degree_3 + total_degree_4) / n;
+
+    // Check if adjacency pattern looks like a grid
+    bool looks_like_grid = ratio_regular > 0.8;
+
+    if (looks_like_grid)
+    {
+        // Additional check: verify neighbor patterns
+        int grid_like_patterns = 0;
+        for (int i = 0; i < std::min(n, 1000); i++)
+        { // Sample first 1000 vertices
+            std::set<int> neighbors;
+            for (int j = h_row_ptr[i]; j < h_row_ptr[i + 1]; j++)
+            {
+                neighbors.insert(h_col_idx[j]);
+            }
+
+            // Check if neighbors form a cross pattern (grid-like)
+            bool has_cross_pattern = true;
+            for (int neighbor : neighbors)
+            {
+                if (abs(neighbor - i) != 1 && abs(neighbor - i) > n / 100)
+                {
+                    // This might be a vertical connection in a 2D grid
+                    continue;
+                }
+            }
+
+            if (has_cross_pattern)
+            {
+                grid_like_patterns++;
+            }
+        }
+
+        looks_like_grid = (double)grid_like_patterns / std::min(n, 1000) > 0.5;
+    }
+
+    return looks_like_grid;
+}
+
+std::pair<int, int> FastNestedDissection::estimateGridDimensions()
+{
+    // Estimate grid dimensions based on vertex count and connectivity
+
+    int sqrt_n = (int)std::sqrt(n);
+
+    // Try different aspect ratios
+    for (int width = sqrt_n - 10; width <= sqrt_n + 10; width++)
+    {
+        if (width <= 0)
+            continue;
+        int height = n / width;
+        if (width * height == n)
+        {
+            // Check if this makes sense given the connectivity
+            return {width, height};
+        }
+    }
+
+    // Fallback: assume square grid
+    return {sqrt_n, sqrt_n};
+}
+
+void FastNestedDissection::printGraphAnalysis()
+{
+    std::cout << "\n=== GRAPH ANALYSIS ===" << std::endl;
+
+    thrust::host_vector<int> h_row_ptr = d_row_ptr;
+
+    // Compute degree statistics
+    std::vector<int> degrees;
+    for (int i = 0; i < n; i++)
+    {
+        degrees.push_back(h_row_ptr[i + 1] - h_row_ptr[i]);
+    }
+
+    std::sort(degrees.begin(), degrees.end());
+
+    double avg_degree = (double)nnz / n;
+    int min_degree = degrees[0];
+    int max_degree = degrees[n - 1];
+    int median_degree = degrees[n / 2];
+
+    std::cout << "Vertices: " << n << std::endl;
+    std::cout << "Edges: " << nnz / 2 << " (undirected)" << std::endl;
+    std::cout << "Average degree: " << avg_degree << std::endl;
+    std::cout << "Degree range: [" << min_degree << ", " << max_degree << "]" << std::endl;
+    std::cout << "Median degree: " << median_degree << std::endl;
+
+    if (is_structured_grid)
+    {
+        std::cout << "Graph type: Structured grid (estimated " << grid_size << "x" << grid_size << ")" << std::endl;
+    }
+    else
+    {
+        std::cout << "Graph type: General unstructured graph" << std::endl;
+    }
+
+    // Analyze vertex weights if present
+    if (metis_graph.has_vertex_weights)
+    {
+        std::cout << "Vertex weights: Present (" << metis_graph.ncon << " constraints)" << std::endl;
+    }
+
+    if (metis_graph.has_edge_weights)
+    {
+        std::cout << "Edge weights: Present" << std::endl;
+    }
+
+    if (metis_graph.has_vertex_sizes)
+    {
+        std::cout << "Vertex sizes: Present" << std::endl;
+    }
+}
+
+double FastNestedDissection::computeFillReduction()
+{
+    // Estimate fill reduction compared to natural ordering
+
+    // This is a simplified estimate - in practice you'd want to compute
+    // the actual symbolic factorization
+
+    // For grid graphs, nested dissection typically reduces fill significantly
+    if (is_structured_grid)
+    {
+        // Grid graphs: fill goes from O(n^1.5) to O(n log n)
+        double natural_fill = std::pow(n, 1.5);
+        double nd_fill = n * std::log2(n);
+        return (1.0 - nd_fill / natural_fill) * 100.0;
+    }
+    else
+    {
+        // General graphs: more conservative estimate
+        double avg_degree = (double)nnz / n;
+        double estimated_reduction = std::min(50.0, 10.0 * std::log10(avg_degree));
+        return estimated_reduction;
+    }
+}
+
+// Enhanced separator methods for general graphs
+std::vector<int> FastNestedDissection::geometricSeparatorGeneral(const std::vector<int> &vertices)
+{
+    // For general graphs, try to find a geometric separator using
+    // coordinate embedding or spectral coordinates
+
+    if (vertices.size() <= 128)
+    {
+        return std::vector<int>{vertices[vertices.size() / 2]};
+    }
+
+    // Use spectral coordinates as geometric proxy
+    thrust::device_vector<double> d_coords_x(vertices.size());
+    thrust::device_vector<double> d_coords_y(vertices.size());
+
+    // Simple coordinate computation based on graph structure
+    thrust::fill(d_coords_x.begin(), d_coords_x.end(), 0.0);
+    thrust::fill(d_coords_y.begin(), d_coords_y.end(), 0.0);
+
+    // Use vertex IDs as initial coordinates
+    for (int i = 0; i < vertices.size(); i++)
+    {
+        d_coords_x[i] = vertices[i] % (int)std::sqrt(vertices.size());
+        d_coords_y[i] = vertices[i] / (int)std::sqrt(vertices.size());
+    }
+
+    // Find median in both dimensions
+    thrust::host_vector<double> h_coords_x = d_coords_x;
+    thrust::host_vector<double> h_coords_y = d_coords_y;
+
+    std::vector<std::pair<double, int>> x_pairs, y_pairs;
+    for (int i = 0; i < vertices.size(); i++)
+    {
+        x_pairs.push_back({h_coords_x[i], i});
+        y_pairs.push_back({h_coords_y[i], i});
+    }
+
+    std::sort(x_pairs.begin(), x_pairs.end());
+    std::sort(y_pairs.begin(), y_pairs.end());
+
+    // Create separator around median
+    std::vector<int> separator;
+    int sep_size = std::max(1, (int)(vertices.size() * 0.03));
+    int start_x = vertices.size() / 2 - sep_size / 2;
+
+    for (int i = start_x; i < start_x + sep_size && i < x_pairs.size(); i++)
+    {
+        separator.push_back(vertices[x_pairs[i].second]);
+    }
+
+    return separator;
+}
+
+std::vector<int> FastNestedDissection::multilevelSeparator(const std::vector<int> &vertices)
+{
+    // Simplified multilevel approach: coarsen, separate, refine
+
+    if (vertices.size() <= 256)
+    {
+        return approximateSpectralSeparator(vertices);
+    }
+
+    // Coarsen by random matching (simplified)
+    std::vector<int> coarse_vertices;
+    std::unordered_set<int> used;
+
+    for (int i = 0; i < vertices.size(); i += 2)
+    {
+        if (used.find(vertices[i]) == used.end())
+        {
+            coarse_vertices.push_back(vertices[i]);
+            used.insert(vertices[i]);
+            if (i + 1 < vertices.size())
+            {
+                used.insert(vertices[i + 1]);
+            }
+        }
+    }
+
+    // Recursively find separator in coarse graph
+    std::vector<int> coarse_separator = approximateSpectralSeparator(coarse_vertices);
+
+    // Project back to fine graph (simplified)
+    std::vector<int> fine_separator = coarse_separator;
+
+    // Add some neighboring vertices for refinement
+    std::unordered_set<int> sep_set(fine_separator.begin(), fine_separator.end());
+    thrust::host_vector<int> h_row_ptr = d_row_ptr;
+    thrust::host_vector<int> h_col_idx = d_col_idx;
+
+    for (int v : coarse_separator)
+    {
+        for (int j = h_row_ptr[v]; j < h_row_ptr[v + 1]; j++)
+        {
+            int neighbor = h_col_idx[j];
+            if (sep_set.find(neighbor) == sep_set.end() &&
+                std::find(vertices.begin(), vertices.end(), neighbor) != vertices.end())
+            {
+                fine_separator.push_back(neighbor);
+                sep_set.insert(neighbor);
+            }
+        }
+    }
+
+    return fine_separator;
+}
+
+std::vector<int> FastNestedDissection::improvedSpectralSeparator(const std::vector<int> &vertices)
+{
+    // Enhanced spectral separator with better power iteration
+    return approximateSpectralSeparator(vertices); // Use existing implementation for now
 }

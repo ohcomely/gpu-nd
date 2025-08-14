@@ -28,8 +28,13 @@ set(CUDA_SOURCES
     src/main.cu
 )
 
-# Create executable
-add_executable(fast_nested_dissection ${CUDA_SOURCES})
+# C++ source files for METIS parser
+set(CXX_SOURCES
+    src/metis_parser.cpp
+)
+
+# Create main executable
+add_executable(fast_nested_dissection ${CUDA_SOURCES} ${CXX_SOURCES})
 
 # Set CUDA properties
 set_target_properties(fast_nested_dissection PROPERTIES
@@ -52,6 +57,7 @@ target_compile_options(fast_nested_dissection PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:
         -O3
         -march=native
+        -std=c++14
     >
 )
 
@@ -107,8 +113,8 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
     )
 endif()
 
-# Optional: Create a test executable with smaller matrix for quick testing
-add_executable(fast_nested_dissection_test ${CUDA_SOURCES})
+# Create a test executable with smaller matrix for quick testing
+add_executable(fast_nested_dissection_test ${CUDA_SOURCES} ${CXX_SOURCES})
 target_compile_definitions(fast_nested_dissection_test PRIVATE SMALL_TEST_MATRIX=1)
 set_target_properties(fast_nested_dissection_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
@@ -121,6 +127,11 @@ target_compile_options(fast_nested_dissection_test PRIVATE
         --extended-lambda
         -gencode arch=compute_${CUDA_COMPUTE_CAPABILITY},code=sm_${CUDA_COMPUTE_CAPABILITY}
     >
+    $<$<COMPILE_LANGUAGE:CXX>:
+        -O3
+        -march=native
+        -std=c++14
+    >
 )
 target_link_libraries(fast_nested_dissection_test
     ${CUDA_LIBRARIES}
@@ -129,3 +140,40 @@ target_link_libraries(fast_nested_dissection_test
     ${CUDA_cusolver_LIBRARY}
     OpenMP::OpenMP_CXX
 )
+
+# Optional: Create benchmark executable for comparing different graph types
+add_executable(metis_benchmark ${CUDA_SOURCES} ${CXX_SOURCES})
+target_compile_definitions(metis_benchmark PRIVATE BENCHMARK_MODE=1)
+set_target_properties(metis_benchmark PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+target_compile_options(metis_benchmark PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        -O3
+        -use_fast_math
+        --extended-lambda
+        -gencode arch=compute_${CUDA_COMPUTE_CAPABILITY},code=sm_${CUDA_COMPUTE_CAPABILITY}
+    >
+    $<$<COMPILE_LANGUAGE:CXX>:
+        -O3
+        -march=native
+        -std=c++14
+    >
+)
+target_link_libraries(metis_benchmark
+    ${CUDA_LIBRARIES}
+    ${CUDA_cusparse_LIBRARY}
+    ${CUDA_cublas_LIBRARY}
+    ${CUDA_cusolver_LIBRARY}
+    OpenMP::OpenMP_CXX
+)
+
+# Installation
+install(TARGETS fast_nested_dissection 
+        RUNTIME DESTINATION bin)
+
+# Optional: Install sample METIS graphs
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/sample_graphs/
+        DESTINATION share/fast_nested_dissection/graphs
+        OPTIONAL)
